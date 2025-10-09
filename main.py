@@ -3,6 +3,7 @@ import json
 import base64
 import random
 import asyncio
+import re
 import websockets
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -10,6 +11,7 @@ from fastapi.websockets import WebSocketDisconnect
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 from dotenv import load_dotenv
 from voice_personalities import create_personality_prompt, get_personality
+from background_agent_client import create_background_agent_task
 
 load_dotenv()
 
@@ -19,6 +21,9 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
+CURSOR_BG_AGENT_VOICE_ACK = os.getenv('CURSOR_BG_AGENT_VOICE_ACK', 'true').lower() in ('1', 'true', 'yes', 'y')
+
+COMMAND_PATTERN = re.compile(r"\bfoxtrot\s+oscar\s+tangeo\b(.*)$", re.IGNORECASE)
 def create_system_message(voice_name):
     personality = get_personality(voice_name)
     personality_prompt = create_personality_prompt(voice_name)
@@ -156,8 +161,18 @@ async def handle_media_stream(websocket: WebSocket):
                         user_transcript_buffer += response['delta']
 
                     if response.get('type') in ('input_audio_buffer.transcription.done', 'input_audio_buffer.transcription.completed'):
-                        if user_transcript_buffer.strip():
-                            print(f"Caller: {user_transcript_buffer.strip()}")
+                        transcript_text = user_transcript_buffer.strip()
+                        if transcript_text:
+                            print(f"Caller: {transcript_text}")
+                            # Detect background agent command: "foxtrot oscar tangeo <task>"
+                            match = COMMAND_PATTERN.search(transcript_text)
+                            if match:
+                                task_text = match.group(1).strip()
+                                if task_text:
+                                    asyncio.create_task(trigger_background_task(task_text))
+                                else:
+                                    # If no task content was provided, ignore silently
+                                    pass
                         user_transcript_buffer = ""
 
                     if response.get('type') == 'response.output_audio.delta' and 'delta' in response:
@@ -290,6 +305,47 @@ async def handle_media_stream(websocket: WebSocket):
                 }
                 await connection.send_json(mark_event)
                 mark_queue.append('responsePart')
+
+        async def trigger_background_task(task_text: str):
+            """Create a background agent task and optionally voice-acknowledge."""
+            try:
+                metadata = {
+                    "streamSid": stream_sid,
+                    "voice": session_voice,
+                    "source": "phone",
+                }
+                result = await create_background_agent_task(
+                    task_text,
+                    source="dial-aifriend",
+                    metadata=metadata,
+                )
+
+                if CURSOR_BG_AGENT_VOICE_ACK:
+                    title = result.get("title") or (task_text.split("\n")[0][:80])
+                    task_id = result.get("id")
+                    if task_id:
+                        ack_text = f"Created background task: {title} (ID {task_id})."
+                    else:
+                        ack_text = f"Created background task: {title}."
+
+                    # Ask the assistant to confirm briefly
+                    ack_item = {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": f"Say exactly: '{ack_text}'"
+                                }
+                            ]
+                        }
+                    }
+                    await openai_ws.send(json.dumps(ack_item))
+                    await openai_ws.send(json.dumps({"type": "response.create"}))
+            except Exception as e:
+                print(f"Background task creation failed: {e}")
 
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
 

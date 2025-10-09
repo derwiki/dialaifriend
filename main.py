@@ -3,6 +3,9 @@ import json
 import base64
 import random
 import asyncio
+import re
+import time
+import aiohttp
 import websockets
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -19,6 +22,10 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
+
+# Background Agent configuration (Cursor background agent API)
+BACKGROUND_AGENT_API_URL = os.getenv('BACKGROUND_AGENT_API_URL')  # e.g. https://your-bg-agent/api/tasks
+BACKGROUND_AGENT_API_TOKEN = os.getenv('BACKGROUND_AGENT_API_TOKEN')
 def create_system_message(voice_name):
     personality = get_personality(voice_name)
     personality_prompt = create_personality_prompt(voice_name)
@@ -30,7 +37,7 @@ def create_system_message(voice_name):
         "Then ask them a specific question like 'What did you eat today?' or, 'did you play with any toys?', or 'did you play with anyone today?'"
         "Keep it brief and friendly, then wait for their response.\n\n"
         "DEVELOPER MODE CONTROL:\n"
-        "- Activation pass phrase: if the caller says 'Foxtrot Oscar Tango' (any case), immediately say exactly: 'entering developer mode' and switch to Developer Mode for the remainder of the call.\n"
+        "- Activation pass phrase: if the caller says 'Foxtrot Oscar Tangeo' (current dev phase) or 'Foxtrot Oscar Tango' (any case), immediately say exactly: 'entering developer mode' and switch to Developer Mode for the remainder of the call.\n"
         "- In Developer Mode: drop toddler constraints and adopt a concise, highly-technical assistant persona similar to a senior ChatGPT developer assistant. Be direct, structured, and solution-oriented; prefer bullet points, actionable steps, and code examples when useful; avoid filler.\n"
         "- While in Developer Mode: assume the caller is the developer of this phone-based chat app; keep responses succinct and high-signal.\n"
         "- When developer mode is active, ignore toddler conversation rules and use adult language and content appropriate for software engineers."
@@ -100,6 +107,133 @@ async def handle_media_stream(websocket: WebSocket):
         last_speech_stopped_timestamp = None
         assistant_text_buffer = ""
         user_transcript_buffer = ""
+        last_bg_task_text = None
+
+        def _extract_foxtrot_task(transcript_text: str):
+            """Return task text if transcript contains the trigger phrase.
+
+            Trigger phrase: "foxtrot oscar tangeo" (dev phase) or the common variant "foxtrot oscar tango".
+            Returns the remainder of the transcript after the phrase, stripped, or None if no trigger found.
+            """
+            if not transcript_text:
+                return None
+            lower_text = transcript_text.lower()
+            # Match tangeo/tango with flexible whitespace
+            match = re.search(r"\bfoxtrot\s+oscar\s+tan(?:geo|go)\b", lower_text)
+            if not match:
+                return None
+            # Extract the remainder of the ORIGINAL transcript (preserve casing for readability)
+            remainder = transcript_text[match.end():].strip(" \t\n\r,.;:!-?")
+            return remainder
+
+        async def _trigger_background_agent_task(task_text: str):
+            """Call the configured background agent API with the provided task text.
+
+            Returns (success: bool, info: str) where info may be task id/url or error message.
+            """
+            if not BACKGROUND_AGENT_API_URL:
+                return False, "BACKGROUND_AGENT_API_URL not configured"
+
+            payload = {
+                "title": (task_text[:120] if task_text else "Phone task"),
+                "description": task_text or "",
+                "source": "dialaifriend-phone",
+                "metadata": {
+                    "voice": session_voice,
+                    "streamSid": stream_sid,
+                    "timestamp": int(time.time()),
+                },
+            }
+
+            headers = {"Content-Type": "application/json"}
+            if BACKGROUND_AGENT_API_TOKEN:
+                headers["Authorization"] = f"Bearer {BACKGROUND_AGENT_API_TOKEN}"
+
+            try:
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(BACKGROUND_AGENT_API_URL, json=payload, headers=headers) as resp:
+                        text = await resp.text()
+                        if 200 <= resp.status < 300:
+                            try:
+                                data = await resp.json()
+                            except Exception:
+                                data = {"raw": text}
+                            # Try to surface a useful identifier if present
+                            task_identifier = (
+                                data.get("url")
+                                or data.get("html_url")
+                                or data.get("id")
+                                or data.get("task_id")
+                                or "created"
+                            )
+                            return True, str(task_identifier)
+                        else:
+                            return False, f"HTTP {resp.status}: {text}"
+            except Exception as e:
+                return False, f"Exception contacting background agent: {e}"
+
+        async def _maybe_handle_background_agent_trigger(transcript_text: str):
+            nonlocal last_bg_task_text
+            task_text = _extract_foxtrot_task(transcript_text)
+            if task_text is None:
+                return
+
+            # Avoid duplicate triggers for identical task text back-to-back
+            if last_bg_task_text and task_text == last_bg_task_text:
+                return
+
+            # If no additional input after the trigger phrase, ask the caller for a one-sentence task
+            if not task_text:
+                prompt_item = {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "The caller spoke the trigger phrase 'Foxtrot Oscar Tangeo' but did not provide a task. "
+                                    "Ask them, succinctly: 'What task should I start for you? Say one short sentence.'"
+                                ),
+                            }
+                        ],
+                    },
+                }
+                await openai_ws.send(json.dumps(prompt_item))
+                await openai_ws.send(json.dumps({"type": "response.create"}))
+                last_bg_task_text = ""
+                return
+
+            success, info = await _trigger_background_agent_task(task_text)
+            last_bg_task_text = task_text
+
+            # Tell the AI to briefly confirm to the caller
+            if success:
+                confirm_text = (
+                    f"Background agent task created from phone: '{task_text}'. "
+                    f"If the caller asks, you can mention reference: {info}. "
+                    "Acknowledge briefly and ask if they want to add details."
+                )
+            else:
+                confirm_text = (
+                    f"Attempted to create a background agent task from phone but failed: {info}. "
+                    "Apologize briefly and ask the caller to repeat the request or try again later."
+                )
+
+            prompt_item = {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": confirm_text}
+                    ],
+                },
+            }
+            await openai_ws.send(json.dumps(prompt_item))
+            await openai_ws.send(json.dumps({"type": "response.create"}))
         
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
@@ -157,7 +291,10 @@ async def handle_media_stream(websocket: WebSocket):
 
                     if response.get('type') in ('input_audio_buffer.transcription.done', 'input_audio_buffer.transcription.completed'):
                         if user_transcript_buffer.strip():
-                            print(f"Caller: {user_transcript_buffer.strip()}")
+                            transcript_snapshot = user_transcript_buffer.strip()
+                            print(f"Caller: {transcript_snapshot}")
+                            # Handle background agent trigger phrase asynchronously so we don't block audio flow
+                            asyncio.create_task(_maybe_handle_background_agent_trigger(transcript_snapshot))
                         user_transcript_buffer = ""
 
                     if response.get('type') == 'response.output_audio.delta' and 'delta' in response:

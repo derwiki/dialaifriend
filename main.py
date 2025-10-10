@@ -23,7 +23,7 @@ PORT = int(os.getenv('PORT', 5050))
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
 CURSOR_BG_AGENT_VOICE_ACK = os.getenv('CURSOR_BG_AGENT_VOICE_ACK', 'true').lower() in ('1', 'true', 'yes', 'y')
 
-COMMAND_PATTERN = re.compile(r"\bfoxtrot\s+oscar\s+tangeo\b(.*)$", re.IGNORECASE)
+COMMAND_PATTERN = re.compile(r"\bfoxtrot\s+oscar\s+tango\b(.*)$", re.IGNORECASE)
 def create_system_message(voice_name):
     personality = get_personality(voice_name)
     personality_prompt = create_personality_prompt(voice_name)
@@ -164,7 +164,7 @@ async def handle_media_stream(websocket: WebSocket):
                         transcript_text = user_transcript_buffer.strip()
                         if transcript_text:
                             print(f"Caller: {transcript_text}")
-                            # Detect background agent command: "foxtrot oscar tangeo <task>"
+                            # Detect background agent command: "foxtrot oscar tango <task>"
                             match = COMMAND_PATTERN.search(transcript_text)
                             if match:
                                 task_text = match.group(1).strip()

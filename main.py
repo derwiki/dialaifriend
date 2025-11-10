@@ -6,6 +6,9 @@ import asyncio
 import websockets
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
+from typing import Any, Dict, Optional
+from mcp_integration import get_mcp_manager
 from fastapi.websockets import WebSocketDisconnect
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 from dotenv import load_dotenv
@@ -348,6 +351,44 @@ async def initialize_session(openai_ws, voice=None):
 
     # Have the AI speak first to introduce itself
     await send_initial_conversation_item(openai_ws)
+
+# ==============================
+# MCP Integration API Endpoints
+# ==============================
+
+class MCPCallRequest(BaseModel):
+    tool: str
+    arguments: Optional[Dict[str, Any]] = None
+
+
+@app.get("/mcp/servers", response_class=JSONResponse)
+async def mcp_list_servers():
+    manager = get_mcp_manager()
+    return {"servers": manager.list_servers()}
+
+
+@app.get("/mcp/{server}/tools", response_class=JSONResponse)
+async def mcp_list_tools(server: str):
+    manager = get_mcp_manager()
+    conn = manager.get(server)
+    tools = await conn.list_tools()
+    return {"server": server, "tools": tools}
+
+
+@app.get("/mcp/{server}/resources", response_class=JSONResponse)
+async def mcp_list_resources(server: str):
+    manager = get_mcp_manager()
+    conn = manager.get(server)
+    resources = await conn.list_resources()
+    return {"server": server, "resources": resources}
+
+
+@app.post("/mcp/{server}/call", response_class=JSONResponse)
+async def mcp_call_tool(server: str, payload: MCPCallRequest):
+    manager = get_mcp_manager()
+    conn = manager.get(server)
+    result = await conn.call_tool(payload.tool, payload.arguments)
+    return {"server": server, "tool": payload.tool, "result": result}
 
 if __name__ == "__main__":
     import uvicorn

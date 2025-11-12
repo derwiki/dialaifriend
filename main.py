@@ -9,34 +9,30 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 from dotenv import load_dotenv
-from voice_personalities import create_personality_prompt, get_personality
 
 load_dotenv()
 
-# We'll generate greetings dynamically with voice names
+# We'll generate greetings dynamically with voice settings
 
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
-TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
-def create_system_message(voice_name):
-    personality = get_personality(voice_name)
-    personality_prompt = create_personality_prompt(voice_name)
+TEMPERATURE = float(os.getenv('TEMPERATURE', 0.7))
 
+def create_system_message(voice_name: str) -> str:
+    """Create system instructions for a professional digital voice assistant."""
     return (
-        f"{personality_prompt}\n\n"
-        "When you first connect, wait 2 seconds before introducing yourself by saying "
-        f"'Hi Elodie, this is {personality['name']}. {personality['personality'].split('.')[0]}.' "
-        "Then ask them a specific question like 'What did you eat today?' or, 'did you play with any toys?', or 'did you play with anyone today?'"
-        "Keep it brief and friendly, then wait for their response.\n\n"
-        "DEVELOPER MODE CONTROL:\n"
-        "- Activation pass phrase: if the caller says 'Foxtrot Oscar Tango' (any case), immediately say exactly: 'entering developer mode' and switch to Developer Mode for the remainder of the call.\n"
-        "- In Developer Mode: drop toddler constraints and adopt a concise, highly-technical assistant persona similar to a senior ChatGPT developer assistant. Be direct, structured, and solution-oriented; prefer bullet points, actionable steps, and code examples when useful; avoid filler.\n"
-        "- While in Developer Mode: assume the caller is the developer of this phone-based chat app; keep responses succinct and high-signal.\n"
-        "- When developer mode is active, ignore toddler conversation rules and use adult language and content appropriate for software engineers."
+        "You are a professional, helpful, and efficient digital voice assistant speaking on a phone call.\n"
+        "Style: concise, clear, adult-friendly, and solutions-oriented.\n"
+        "Behavior:\n"
+        "- Ask targeted clarifying questions before acting if requirements are ambiguous.\n"
+        "- Default to short answers (1–2 sentences). Use bullet points only when enumerating steps.\n"
+        "- Avoid filler and small talk unless the caller requests it.\n"
+        "- Confirm important details back to the caller before proceeding.\n\n"
+        "On connect: wait ~1 second, then say: 'Hi, this is your digital assistant. How can I help today?' and pause to listen.\n"
     )
-VOICE = 'alloy'
-VOICES = ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse', 'marin', 'cedar']
+VOICE = 'alloy'  # Default adult-sounding voice
+VOICES = ['alloy']  # Use a single consistent voice for calls
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
     'response.done', 'input_audio_buffer.committed',
@@ -59,8 +55,8 @@ async def handle_incoming_call(request: Request):
     """Handle incoming call and return TwiML response to connect to Media Stream."""
     response = VoiceResponse()
 
-    # Pick a random voice for this call
-    greeting_voice = random.choice(VOICES)
+    # Use a single consistent voice for this call
+    greeting_voice = VOICE
 
     # Just connect to the media stream - let the AI do the greeting
     host = request.url.hostname
@@ -77,7 +73,7 @@ async def handle_media_stream(websocket: WebSocket):
     await websocket.accept()
 
     # Extract the voice parameter from the query string
-    session_voice = random.choice(VOICES)  # Default fallback
+    session_voice = VOICE  # Default fallback
     if websocket.query_params.get("voice") and websocket.query_params["voice"] in VOICES:
         session_voice = websocket.query_params["voice"]
         print(f"Using voice from greeting: {session_voice}")
@@ -198,7 +194,7 @@ async def handle_media_stream(websocket: WebSocket):
                     
                     elif response.get('type') == 'response.done':
                         print("AI finished speaking - restarting silence timeout")
-                        # AI finished speaking, restart the timeout to wait for toddler's response
+                        # AI finished speaking, restart the timeout to wait for the caller's response
                         await start_silence_timeout()
             except Exception as e:
                 print(f"Error in send_to_twilio: {e}")
@@ -241,9 +237,9 @@ async def handle_media_stream(websocket: WebSocket):
                 response_start_timestamp_twilio = None
 
         async def handle_silence_timeout():
-            """Handle when the toddler has been silent for too long."""
+            """Handle when the caller has been silent for too long."""
             nonlocal silence_timeout_task, last_speech_stopped_timestamp
-            print("Silence timeout - toddler hasn't spoken for 15 seconds")
+            print("Silence timeout - caller hasn't spoken for 15 seconds")
             
             # Send a conversation item to fill the silence
             silence_filler_item = {
@@ -254,7 +250,11 @@ async def handle_media_stream(websocket: WebSocket):
                     "content": [
                         {
                             "type": "input_text",
-                            "text": "The caller has been quiet for a while. If you are currently in Developer Mode (activated by the caller saying 'Foxtrot Oscar Tango'), continue in Developer Mode: ask a concise, high-signal, technical clarifying question or propose next actionable steps related to the most recent topic. Keep responses succinct and professional. Otherwise (toddler mode), say something engaging to get a 4-year-old talking again, like asking about their favorite color, toys, or pets. Keep it light and fun!"
+                            "text": (
+                                "The caller has been quiet for a while. Politely check in with a brief, helpful prompt. "
+                                "Offer a concise follow-up question related to the last discussed topic or ask if they need more help. "
+                                "Keep it professional and succinct."
+                            )
                         }
                     ]
                 }
@@ -315,7 +315,7 @@ async def send_initial_conversation_item(openai_ws):
 async def initialize_session(openai_ws, voice=None):
     """Control initial session with OpenAI."""
     if voice is None:
-        voice = random.choice(VOICES)
+        voice = VOICE
 
     # Create personalized system message for this voice
     system_message = create_system_message(voice)

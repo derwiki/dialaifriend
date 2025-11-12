@@ -31,8 +31,8 @@ def create_system_message(voice_name: str) -> str:
         "- Confirm important details back to the caller before proceeding.\n\n"
         "On connect: wait ~1 second, then say: 'Hi, this is your digital assistant. How can I help today?' and pause to listen.\n"
     )
-VOICE = 'verse'  # Default adult-sounding voice known to be compatible
-VOICES = ['verse']  # Use a single consistent, compatible voice for calls
+VOICE = 'alloy'  # Default adult-sounding voice
+VOICES = ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse', 'marin', 'cedar']  # Restore full list
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
     'response.done', 'input_audio_buffer.committed',

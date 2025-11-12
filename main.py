@@ -31,8 +31,8 @@ def create_system_message(voice_name: str) -> str:
         "- Confirm important details back to the caller before proceeding.\n\n"
         "On connect: wait ~1 second, then say: 'Hi, this is your digital assistant. How can I help today?' and pause to listen.\n"
     )
-VOICE = 'alloy'  # Default adult-sounding voice
-VOICES = ['alloy']  # Use a single consistent voice for calls
+VOICE = 'verse'  # Default adult-sounding voice known to be compatible
+VOICES = ['verse']  # Use a single consistent, compatible voice for calls
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
     'response.done', 'input_audio_buffer.committed',
@@ -162,7 +162,8 @@ async def handle_media_stream(websocket: WebSocket):
                             silence_timeout_task.cancel()
                             silence_timeout_task = None
                         
-                        audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
+                        # Pass through OpenAI's base64 audio payload directly
+                        audio_payload = response['delta']
                         audio_delta = {
                             "event": "media",
                             "streamSid": stream_sid,

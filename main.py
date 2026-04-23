@@ -4,6 +4,10 @@ import base64
 import random
 import asyncio
 import websockets
+import logging
+import time
+import uuid
+import audioop
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
@@ -19,6 +23,20 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
+
+# Logging and diagnostics configuration (safe defaults)
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
+ENABLE_CONV_TEXT_LOG = os.getenv('ENABLE_CONV_TEXT_LOG', '0').lower() in ("1", "true", "yes", "on")
+ENABLE_AUDIO_DEBUG = os.getenv('ENABLE_AUDIO_DEBUG', '0').lower() in ("1", "true", "yes", "on")
+LOG_DEBUG_EVENTS = os.getenv('LOG_DEBUG_EVENTS', '0').lower() in ("1", "true", "yes", "on")
+
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL, logging.INFO),
+        format='%(asctime)s %(levelname)s %(message)s'
+    )
+
+setup_logging()
 def create_system_message(voice_name):
     personality = get_personality(voice_name)
     personality_prompt = create_personality_prompt(voice_name)
@@ -88,14 +106,15 @@ async def handle_incoming_call(request: Request):
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
     """Handle WebSocket connections between Twilio and OpenAI."""
-    print("Client connected")
+    call_id = str(uuid.uuid4())[:8]
+    logging.info(f"[{call_id}] Client connected")
     await websocket.accept()
 
     # Extract the voice parameter from the query string
     session_voice = random.choice(VOICES)  # Default fallback
     if websocket.query_params.get("voice") and websocket.query_params["voice"] in VOICES:
         session_voice = websocket.query_params["voice"]
-        print(f"Using voice from greeting: {session_voice}")
+        logging.info(f"[{call_id}] Using voice from greeting: {session_voice}")
 
     async with websockets.connect(
         f"wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature={TEMPERATURE}",
@@ -115,6 +134,13 @@ async def handle_media_stream(websocket: WebSocket):
         last_speech_stopped_timestamp = None
         assistant_text_buffer = ""
         user_transcript_buffer = ""
+
+        # Audio debug accumulators
+        inbound_pcm_accum = b""
+        inbound_frame_count = 0
+        outbound_pcm_accum = b""
+        outbound_frame_count = 0
+        last_audio_debug_log_time = time.monotonic()
         
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
@@ -129,9 +155,27 @@ async def handle_media_stream(websocket: WebSocket):
                             "audio": data['media']['payload']
                         }
                         await openai_ws.send(json.dumps(audio_append))
+                        if ENABLE_AUDIO_DEBUG:
+                            try:
+                                ulaw_bytes = base64.b64decode(data['media']['payload'])
+                                pcm16 = audioop.ulaw2lin(ulaw_bytes, 2)
+                                inbound_pcm_accum += pcm16
+                                # 20ms @ 8kHz ≈ 160 samples per frame
+                                inbound_frame_count += max(1, len(ulaw_bytes) // 160)
+                                now = time.monotonic()
+                                if inbound_frame_count >= 50 or (now - last_audio_debug_log_time) > 1.25:
+                                    rms = audioop.rms(inbound_pcm_accum, 2)
+                                    peak = audioop.max(inbound_pcm_accum, 2)
+                                    dc = audioop.avg(inbound_pcm_accum, 2)
+                                    logging.debug(f"[{call_id}] audio.in rms={rms} peak={peak} dc={dc} frames={inbound_frame_count}")
+                                    inbound_pcm_accum = b""
+                                    inbound_frame_count = 0
+                                    last_audio_debug_log_time = now
+                            except Exception as e:
+                                logging.debug(f"[{call_id}] audio.in debug failure: {e}")
                     elif data['event'] == 'start':
                         stream_sid = data['start']['streamSid']
-                        print(f"Incoming stream has started {stream_sid}")
+                        logging.info(f"[{call_id}] Incoming stream has started {stream_sid}")
                         response_start_timestamp_twilio = None
                         latest_media_timestamp = 0
                         last_assistant_item = None
@@ -139,41 +183,36 @@ async def handle_media_stream(websocket: WebSocket):
                         if mark_queue:
                             mark_queue.pop(0)
             except WebSocketDisconnect:
-                print("Client disconnected.")
+                logging.info(f"[{call_id}] Client disconnected.")
                 if openai_ws.state.name == 'OPEN':
                     await openai_ws.close()
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, silence_timeout_task, assistant_text_buffer, user_transcript_buffer
+            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, silence_timeout_task, assistant_text_buffer, user_transcript_buffer, outbound_pcm_accum, outbound_frame_count, last_audio_debug_log_time
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
-                    if response['type'] in LOG_EVENT_TYPES:
-                        print(f"Received event: {response['type']}", response)
+                    if LOG_DEBUG_EVENTS and response.get('type') in LOG_EVENT_TYPES:
+                        logging.debug(f"[{call_id}] event: {response['type']}")
 
-                    # Accumulate assistant text output
-                    if response.get('type') == 'response.output_text.delta' and 'delta' in response:
-                        assistant_text_buffer += response['delta']
-
-                    if response.get('type') == 'response.output_text.done':
-                        if assistant_text_buffer.strip():
-                            print(f"Assistant: {assistant_text_buffer.strip()}")
-                        assistant_text_buffer = ""
-
-                    # Fallback: if response finishes without explicit output_text.done
-                    if response.get('type') == 'response.done' and assistant_text_buffer.strip():
-                        print(f"Assistant: {assistant_text_buffer.strip()}")
-                        assistant_text_buffer = ""
-
-                    # Accumulate caller transcription
-                    if response.get('type') == 'input_audio_buffer.transcription.delta' and 'delta' in response:
-                        user_transcript_buffer += response['delta']
-
-                    if response.get('type') in ('input_audio_buffer.transcription.done', 'input_audio_buffer.transcription.completed'):
-                        if user_transcript_buffer.strip():
-                            print(f"Caller: {user_transcript_buffer.strip()}")
-                        user_transcript_buffer = ""
+                    # Conversation logging (optional)
+                    if ENABLE_CONV_TEXT_LOG:
+                        if response.get('type') == 'response.output_text.delta' and 'delta' in response:
+                            assistant_text_buffer += response['delta']
+                        if response.get('type') == 'response.output_text.done':
+                            if assistant_text_buffer.strip():
+                                logging.info(f"[{call_id}] Assistant: {assistant_text_buffer.strip()}")
+                            assistant_text_buffer = ""
+                        if response.get('type') == 'response.done' and assistant_text_buffer.strip():
+                            logging.info(f"[{call_id}] Assistant: {assistant_text_buffer.strip()}")
+                            assistant_text_buffer = ""
+                        if response.get('type') == 'input_audio_buffer.transcription.delta' and 'delta' in response:
+                            user_transcript_buffer += response['delta']
+                        if response.get('type') in ('input_audio_buffer.transcription.done', 'input_audio_buffer.transcription.completed'):
+                            if user_transcript_buffer.strip():
+                                logging.info(f"[{call_id}] Caller: {user_transcript_buffer.strip()}")
+                            user_transcript_buffer = ""
 
                     if response.get('type') == 'response.output_audio.delta' and 'delta' in response:
                         # Cancel silence timeout when AI starts speaking
@@ -191,37 +230,55 @@ async def handle_media_stream(websocket: WebSocket):
                         }
                         await websocket.send_json(audio_delta)
 
+                        if ENABLE_AUDIO_DEBUG:
+                            try:
+                                ulaw_bytes = base64.b64decode(response['delta'])
+                                pcm16 = audioop.ulaw2lin(ulaw_bytes, 2)
+                                outbound_pcm_accum += pcm16
+                                outbound_frame_count += max(1, len(ulaw_bytes) // 160)
+                                now = time.monotonic()
+                                if outbound_frame_count >= 50 or (now - last_audio_debug_log_time) > 1.25:
+                                    rms = audioop.rms(outbound_pcm_accum, 2)
+                                    peak = audioop.max(outbound_pcm_accum, 2)
+                                    dc = audioop.avg(outbound_pcm_accum, 2)
+                                    logging.debug(f"[{call_id}] audio.out rms={rms} peak={peak} dc={dc} frames={outbound_frame_count}")
+                                    outbound_pcm_accum = b""
+                                    outbound_frame_count = 0
+                                    last_audio_debug_log_time = now
+                            except Exception as e:
+                                logging.debug(f"[{call_id}] audio.out debug failure: {e}")
+
 
                         if response.get("item_id") and response["item_id"] != last_assistant_item:
                             response_start_timestamp_twilio = latest_media_timestamp
                             last_assistant_item = response["item_id"]
                             if SHOW_TIMING_MATH:
-                                print(f"Setting start timestamp for new response: {response_start_timestamp_twilio}ms")
+                                logging.debug(f"[{call_id}] Setting start timestamp for new response: {response_start_timestamp_twilio}ms")
 
                         await send_mark(websocket, stream_sid)
 
                     # Handle speech events
                     if response.get('type') == 'input_audio_buffer.speech_started':
-                        print("Speech started detected.")
+                        logging.debug(f"[{call_id}] Speech started detected.")
                         if last_assistant_item:
-                            print(f"Interrupting response with id: {last_assistant_item}")
+                            logging.debug(f"[{call_id}] Interrupting response with id: {last_assistant_item}")
                             await handle_speech_started_event()
                     
                     elif response.get('type') == 'input_audio_buffer.speech_stopped':
-                        print("Speech stopped detected - starting silence timeout")
+                        logging.debug(f"[{call_id}] Speech stopped detected - starting silence timeout")
                         await start_silence_timeout()
                     
                     elif response.get('type') == 'response.done':
-                        print("AI finished speaking - restarting silence timeout")
+                        logging.debug(f"[{call_id}] AI finished speaking - restarting silence timeout")
                         # AI finished speaking, restart the timeout to wait for toddler's response
                         await start_silence_timeout()
             except Exception as e:
-                print(f"Error in send_to_twilio: {e}")
+                logging.exception(f"[{call_id}] Error in send_to_twilio: {e}")
 
         async def handle_speech_started_event():
             """Handle interruption when the caller's speech starts."""
             nonlocal response_start_timestamp_twilio, last_assistant_item, silence_timeout_task, last_speech_stopped_timestamp
-            print("Handling speech started event.")
+            logging.debug(f"[{call_id}] Handling speech started event.")
             
             # Cancel any pending silence timeout and clear the timestamp
             if silence_timeout_task:
@@ -232,11 +289,11 @@ async def handle_media_stream(websocket: WebSocket):
             if mark_queue and response_start_timestamp_twilio is not None:
                 elapsed_time = latest_media_timestamp - response_start_timestamp_twilio
                 if SHOW_TIMING_MATH:
-                    print(f"Calculating elapsed time for truncation: {latest_media_timestamp} - {response_start_timestamp_twilio} = {elapsed_time}ms")
+                    logging.debug(f"[{call_id}] Calculating elapsed time for truncation: {latest_media_timestamp} - {response_start_timestamp_twilio} = {elapsed_time}ms")
 
                 if last_assistant_item:
                     if SHOW_TIMING_MATH:
-                        print(f"Truncating item with ID: {last_assistant_item}, Truncated at: {elapsed_time}ms")
+                        logging.debug(f"[{call_id}] Truncating item with ID: {last_assistant_item}, Truncated at: {elapsed_time}ms")
 
                     truncate_event = {
                         "type": "conversation.item.truncate",
@@ -258,7 +315,7 @@ async def handle_media_stream(websocket: WebSocket):
         async def handle_silence_timeout():
             """Handle when the toddler has been silent for too long."""
             nonlocal silence_timeout_task, last_speech_stopped_timestamp
-            print("Silence timeout - toddler hasn't spoken for 15 seconds")
+            logging.info(f"[{call_id}] Silence timeout - toddler hasn't spoken for 15 seconds")
             
             # Send a conversation item to fill the silence
             silence_filler_item = {
@@ -335,18 +392,25 @@ async def initialize_session(openai_ws, voice=None):
     # Create personalized system message for this voice
     system_message = create_system_message(voice)
 
+    output_modalities = ["audio"]
+    if ENABLE_CONV_TEXT_LOG:
+        output_modalities.append("text")
+
+    audio_input_cfg = {
+        "format": {"type": "audio/pcmu"},
+        "turn_detection": {"type": "server_vad"}
+    }
+    if ENABLE_CONV_TEXT_LOG:
+        audio_input_cfg["transcription"] = {"enabled": True}
+
     session_update = {
         "type": "session.update",
         "session": {
             "type": "realtime",
             "model": "gpt-realtime",
-            "output_modalities": ["audio", "text"],
+            "output_modalities": output_modalities,
             "audio": {
-                "input": {
-                    "format": {"type": "audio/pcmu"},
-                    "turn_detection": {"type": "server_vad"},
-                    "transcription": {"enabled": True}
-                },
+                "input": audio_input_cfg,
                 "output": {
                     "format": {"type": "audio/pcmu"},
                     "voice": voice
@@ -355,7 +419,7 @@ async def initialize_session(openai_ws, voice=None):
             "instructions": system_message,
         }
     }
-    print('Sending session update:', json.dumps(session_update))
+    logging.debug('Sending session update: %s', json.dumps(session_update))
     await openai_ws.send(json.dumps(session_update))
 
     # Wait for connection to be fully established before AI speaks

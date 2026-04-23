@@ -19,24 +19,21 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
-def create_system_message(voice_name):
-    personality = get_personality(voice_name)
-    personality_prompt = create_personality_prompt(voice_name)
 
+def create_system_message(voice_name: str) -> str:
+    """Create system instructions for a professional digital voice assistant."""
     return (
-        f"{personality_prompt}\n\n"
-        "When you first connect, wait 2 seconds before introducing yourself by saying "
-        f"'Hi Elodie, this is {personality['name']}. {personality['personality'].split('.')[0]}.' "
-        "Then ask them a specific question like 'What did you eat today?' or, 'did you play with any toys?', or 'did you play with anyone today?'"
-        "Keep it brief and friendly, then wait for their response.\n\n"
-        "DEVELOPER MODE CONTROL:\n"
-        "- Activation pass phrase: if the caller says 'Foxtrot Oscar Tango' (any case), immediately say exactly: 'entering developer mode' and switch to Developer Mode for the remainder of the call.\n"
-        "- In Developer Mode: drop toddler constraints and adopt a concise, highly-technical assistant persona similar to a senior ChatGPT developer assistant. Be direct, structured, and solution-oriented; prefer bullet points, actionable steps, and code examples when useful; avoid filler.\n"
-        "- While in Developer Mode: assume the caller is the developer of this phone-based chat app; keep responses succinct and high-signal.\n"
-        "- When developer mode is active, ignore toddler conversation rules and use adult language and content appropriate for software engineers."
+        "You are a professional, helpful, and efficient digital voice assistant speaking on a phone call.\n"
+        "Style: concise, clear, adult-friendly, and solutions-oriented.\n"
+        "Behavior:\n"
+        "- Ask targeted clarifying questions before acting if requirements are ambiguous.\n"
+        "- Default to short answers (1–2 sentences). Use bullet points only when enumerating steps.\n"
+        "- Avoid filler and small talk unless the caller requests it.\n"
+        "- Confirm important details back to the caller before proceeding.\n\n"
+        "On connect: wait ~1 second, then say: 'Hi, this is your digital assistant. How can I help today?' and pause to listen.\n"
     )
-VOICE = 'alloy'
-VOICES = ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse', 'marin', 'cedar']
+VOICE = 'alloy'  # Default adult-sounding voice
+VOICES = ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse', 'marin', 'cedar']  # Restore full list
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
     'response.done', 'input_audio_buffer.committed',
